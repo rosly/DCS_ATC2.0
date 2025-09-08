@@ -1,10 +1,13 @@
-# SpicyATC
+# SpicyATC (INSTRUCTIONS UPDATED 09/08/2025)
 
 SpicyATC is a custom Lua script for Digital Combat Simulator (DCS) that replaces or augments the built‑in ATC system with a more realistic, BMS‑style sequence. It introduces state‑driven F10 radio menus, automatic airbase assignment, and simple but improved radio lines. The script is coalition‑aware and works in single‑player or co‑op missions (thats all i have tested. The logic is there for multiplayer. Every function probably wont work). ALSO, THERE IS NO WAY TO REMOVE DEFAULT ATC from DCS. I have tried. That thing will show up no matter what. Well, see if i figure it out.
 
 TUTORIAL VIDEO IS HERE --> ([Watch the video](https://youtu.be/wROWrwPhODA?si=41r6IErKsQECUcN9))
 
 Built by Spicy @spicy2160 (discord)
+
+## UPDATES!!!
+-At this point I have slowed development(i work a ton + some other personal life stuff) but have not abandoned project. I am working with every bit of free time I have and am slowly making progress on the next update for this script. I want it to be filled with improvments, as well as custom audios. I am writing this solo (if you know how to help please reach out, I never wanted this to become laborious, LOL), and also, I am not a software dev. Learning as we go along. Now, for those still reading, I have added the tool to package custom audios to a .miz file, which is necessary since I am not planning on making .miz files for this, and want to work with YOUR files.
 
 ![test](test1.png)
 
@@ -42,9 +45,9 @@ Built by Spicy @spicy2160 (discord)
 
 No additional mods or tools are required.
 
-## Usage (I am going to make a tutorial video, not right now.)
+## Usage (tutorial in youtube above)
 
-When you start the mission, open the F10 menu and select SpicyATC. You will see submenus for Ground, Tower, and Slasher (idk what this is called in BMS, for now pretend it is your overlord). I have tested it for jets and helicopters in single player and it works with full text- functionality. I have also tested on red and blue coalition.
+When you start the mission, open the F10 menu and select SpicyATC. You will see submenus for Ground, Tower, and Slasher (idk what the terminology is called in BMS, for now pretend it is your overlord/air controller). I have tested it for jets and helicopters in single player and it works with full text- functionality. I have also tested on red and blue coalition.
 
 At any point, under the ground menu, hit refresh airbase list, and then return to ground menu, to change your home airbase.
 
