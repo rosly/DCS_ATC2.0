@@ -17,8 +17,15 @@ end
 -- State & Structures
 ---------------------------
 -- Each player record now also tracks hasTakenOff (true when the player has left the runway).
+-- Primary per-unit state table used to drive the state machine for all radio calls.
+-- Possible states: not_started -> started -> on_taxi -> take_off -> airborne -> in_bound -> approach -> landed -> parked.
+-- * Menu path: Request Startup (Ground menu) moves not_started -> started, Request Taxi -> on_taxi, Request Takeoff -> take_off.
+-- * Tower handoff: Request Handoff (Tower menu) invokes setAirborne() once events/timers confirm hasTakenOff.
+-- * Recovery flow: Request Inbound (Slasher menu) enters in_bound, Request Approach -> approach, Request Landing (Tower) acknowledges queue.
+-- * Automatic transitions: DCS events (RUNWAY_TAKEOFF, LAND) or periodicApproachTick() promote players when menu-driven transitions are skipped.
 local players          = {}   -- unitName -> { coalitionID, unitID, airbaseName, state, engineStarted, hasTakenOff }
 local unitCoalitions   = {}   -- unitName -> coalitionID
+-- Queues are maintained per airbase so that handoff/landing clearances happen in the order pilots request them.
 local takeoffQueues    = {}   -- airbaseName -> { unitName1, ... }
 local landingQueues    = {}   -- airbaseName -> { unitName1, ... }
 local menuPaths        = {}   -- coalitionID -> { root, ground, tower, approach, selectAB }
@@ -28,6 +35,8 @@ local telemetry        = {}   -- unitName -> { time=number, point=vec3, speed_mp
 -- Helicopter Support
 ---------------------------
 -- Determine if a unit is a helicopter based upon its description category.
+-- Some flows (e.g. takeoff speed checks) need to differentiate rotorcraft because runway
+-- events are unreliable for FARPs.  We inspect the DCS descriptor category rather than type strings.
 local function isHelicopter(unit)
   if not unit or not unit.getDesc then return false end
   local ok, desc = pcall(unit.getDesc, unit)
@@ -91,6 +100,8 @@ local function getAirbaseName(ab)
 end
 
 local function getPlayerContext()
+  -- The player context is pulled live from world.getPlayer() to avoid caching invalid objects
+  -- (DCS invalidates handles after death).  This function is called from menus and timers alike.
   local unit = world.getPlayer()
   if not unit or not unit.isExist or not unit:isExist() then return nil end
   local ctx = {
@@ -113,6 +124,8 @@ local function getPlayerContext()
 end
 
 -- Capture telemetry for range checks
+-- Telemetry snapshots are used for distance/speed checks between menu invocations and events.
+-- We do not rely solely on event flow because AI units and delayed events can desync the state machine.
 local function captureTelemetry(unit)
   if not unit or not unit.isExist or not unit:isExist() then return end
   local name = unit:getName()
@@ -172,11 +185,13 @@ local periodicApproachTick
 ---------------------------
 -- Menu Building
 ---------------------------
+-- Called from init, player BIRTH events, and the retryAddMenus() watchdog to keep coalition menus present after restarts.
 ensureMenusForCoalition = function(coalitionID)
   if not coalitionID then return end
   menuPaths[coalitionID] = menuPaths[coalitionID] or {}
   local paths = menuPaths[coalitionID]
   if not paths.root then
+    -- Menus are created lazily the first time a coalition connects; missionCommands cannot be reused after removal.
     -- Root
     paths.root = missionCommands.addSubMenuForCoalition(coalitionID, "SpicyATC")
     -- Submenus
@@ -205,6 +220,7 @@ ensureMenusForCoalition = function(coalitionID)
   end
 end
 
+-- Rebuilt whenever players hit "Refresh Airbase List" or a coalition's menus are constructed; reflects dynamic capture states.
 rebuildAirbaseList = function(coalitionID)
   if not coalitionID then return end
   local paths = menuPaths[coalitionID]
@@ -214,6 +230,7 @@ rebuildAirbaseList = function(coalitionID)
     missionCommands.removeItemForCoalition(coalitionID, paths.selectAB)
     paths.selectAB = nil
   end
+  -- The Select menu is rebuilt from scratch so we always reflect live ownership changes.
   paths.selectAB = missionCommands.addSubMenuForCoalition(coalitionID, "Select Home Airbase", paths.ground)
   -- Recommended (nearest owned)
   missionCommands.addCommandForCoalition(coalitionID, "Recommended (Nearest Owned)", paths.selectAB, function()
@@ -242,6 +259,7 @@ end
 ---------------------------
 -- Player Flow / State
 ---------------------------
+-- Callback for Select Home Airbase entries; invoked directly by menu selections and by the auto recommendation helper.
 selectAirbase = function(args)
   local abName = args and args.airbaseName or nil
   local ctx = getPlayerContext(); if not ctx or not abName then return end
@@ -256,7 +274,10 @@ selectAirbase = function(args)
 end
 
 -- Automatically assign the nearest owned airbase to the player if none is set.
+-- Helper fired by menu handlers and BIRTH events to ensure the flow always has a base without manual selection.
 local function autoAssignHomeBase(ctx)
+  -- Menu flow assumes a home base exists.  When players spawn via slots or get slotted late,
+  -- no request has been made yet, so we opportunistically choose the closest owned airbase.
   if not ctx then return end
   local p = players[ctx.unitName]
   if p and not p.airbaseName then
@@ -271,6 +292,7 @@ local function autoAssignHomeBase(ctx)
   end
 end
 
+-- Ground menu entry point; first intentional step in the takeoff chain and prerequisite for Request Taxi.
 requestStartup = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]
@@ -289,6 +311,7 @@ requestStartup = function()
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Not in correct state for startup.", 10, false)
     return
   end
+  -- Startup clearance is the entry point into the takeoff flow; once granted we expect taxi next.
   p.state = "started"
   local group = ctx.group
   local numUnits = group and group.getUnits and #group:getUnits() or 1
@@ -302,6 +325,7 @@ requestStartup = function()
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Ground: " .. msg, 10, false)
 end
 
+-- Ground menu follow-up; grants runway access and seeds movement telemetry for anti-skip checks.
 requestTaxi = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]
@@ -332,11 +356,13 @@ requestTaxi = function()
   captureTelemetry(ctx.unit)
   local t = telemetry[ctx.unitName]
   if t then
+    -- Stash the point to guard against players requesting takeoff without actually taxiing.
     p.taxiStartPoint = t.point
     logf("requestTaxi: stored taxiStartPoint for %s at (x=%.1f,z=%.1f)", ctx.unitName, t.point.x or 0, t.point.z or 0)
   end
 end
 
+-- Tower menu clearance; populates per-airbase takeoff queue and enforces prior taxi approval/movement.
 requestTakeoff = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]
@@ -355,6 +381,7 @@ requestTakeoff = function()
   if p.taxiStartPoint and tCurr and tCurr.point then
     local distMoved = planarDistanceMeters(p.taxiStartPoint, tCurr.point)
     if distMoved < 50 then
+      -- Prevents players from skipping the taxi phase by requesting takeoff while stationary at parking.
       trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Taxi to the runway before requesting takeoff.", 10, false)
       return
     end
@@ -366,6 +393,7 @@ requestTakeoff = function()
   local abName = p.airbaseName
   takeoffQueues[abName] = takeoffQueues[abName] or {}
   local q = takeoffQueues[abName]
+  -- Queue position determines clearance order; we keep players informed of their spot.
   table.insert(q, ctx.unitName)
   local pos = #q
   logf("requestTakeoff: unit=%s queuedPos=%d at=%s", tostring(ctx.unitName), pos, tostring(abName))
@@ -377,6 +405,7 @@ requestTakeoff = function()
   end
 end
 
+-- Tower menu request used post-rotation; relies on RUNWAY_TAKEOFF event (or telemetry fallback) before transitioning to airborne.
 requestHandoff = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]; if not p then return end
@@ -394,12 +423,14 @@ requestHandoff = function()
 end
 
 -- Slasher check‑in command: free trigger after handoff
+-- Optional Slasher (approach) call after tower handoff; does not alter state, just immersive flavor.
 requestSlasherCheckIn = function()
   local ctx = getPlayerContext(); if not ctx then return end
   -- Slasher acknowledges check‑in and instructs player to fly their mission
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Slasher: Check‑in acknowledged. Fly your planned mission.", 10, false)
 end
 
+-- Transition utility invoked by requestHandoff() and fallback heuristics to clear queues and prep landing workflow.
 setAirborne = function(unitName)
   local p = players[unitName]; if not p then return end
   local abName = p.airbaseName
@@ -411,6 +442,7 @@ setAirborne = function(unitName)
   trigger.action.outTextForCoalition(p.coalitionID, "ATC Tower: Handoff acknowledged. Contact Slasher to check in.", 10, false)
   local q = takeoffQueues[abName]
   if q then
+    -- Remove the aircraft from the queue and immediately advance the next client.
     for i, u in ipairs(q) do if u == unitName then table.remove(q, i) break end end
     if #q > 0 then
       local nextUnit = q[1]
@@ -424,6 +456,7 @@ setAirborne = function(unitName)
   end
 end
 
+-- Slasher menu option to declare return-to-base; seeds landing queue and notifies tower loop.
 requestInbound = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName] or { coalitionID = ctx.coalitionID, unitID = ctx.unitID, state = "airborne", engineStarted = true, hasTakenOff = true }
@@ -439,9 +472,11 @@ requestInbound = function()
     end
   end
   if p.state ~= "airborne" or not ctx.unit:inAir() then
+    -- Some modules can sit on the runway but still appear "airborne" in state; the inAir() check guards that edge case.
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Not airborne or incorrect state.", 10, false)
     return
   end
+  -- Transition back into tower control: record the intent and enqueue for landing sequencing.
   p.state = "in_bound"
   landingQueues[p.airbaseName] = landingQueues[p.airbaseName] or {}
   table.insert(landingQueues[p.airbaseName], ctx.unitName)
@@ -450,6 +485,7 @@ requestInbound = function()
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Slasher: Inbound acknowledged. Continue to base. Contact Slasher for approach clearance.", 10, false)
 end
 
+-- Slasher menu follow-up while inbound; enforces 10 NM gate before tower landing calls become available.
 requestApproach = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]; if not p or not p.airbaseName then return end
@@ -460,14 +496,17 @@ requestApproach = function()
   local ab = Airbase.getByName(p.airbaseName)
   local d  = planarDistanceMeters(pointOf(ctx.unit), pointOf(ab))
   if d > 10 * 1852 then
+    -- 10 NM gate mirrors typical pattern entry ranges; outside this we keep the pilot in the inbound phase.
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Too far for approach (current " .. string.format("%.1f", metersToNM(d)) .. " NM).", 10, false)
     return
   end
+  -- Approach is a holding state until tower gives final clearance via requestLanding().
   p.state = "approach"
   logf("requestApproach: unit=%s -> approach (%s)", tostring(ctx.unitName), tostring(p.airbaseName))
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Slasher: Approach cleared. Contact tower for landing clearance.", 10, false)
 end
 
+-- Tower menu entry after Slasher clears approach; reports queue position until LAND event finalizes the cycle.
 requestLanding = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]; if not p or not p.airbaseName then return end
@@ -477,6 +516,7 @@ requestLanding = function()
   end
   local q = landingQueues[p.airbaseName] or {}
   local pos = 0
+  -- Landing queues are seeded during requestInbound; here we simply report the pilot's slot.
   for i, u in ipairs(q) do if u == ctx.unitName then pos = i break end end
   logf("requestLanding: unit=%s queuePos=%d dest=%s", tostring(ctx.unitName), pos, tostring(p.airbaseName))
   if pos == 1 then
@@ -486,6 +526,7 @@ requestLanding = function()
   end
 end
 
+-- Ground menu branch once tower reports the landing; lacks queue mechanics because DCS has no parking occupancy events.
 requestTaxiToParking = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]
@@ -500,6 +541,7 @@ requestTaxiToParking = function()
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Ground: Taxi to parking. Contact ground when ready to shutdown.", 10, false)
 end
 
+-- Closing action for the sortie; lets crews signal they are done and keeps immersion for persistent bases.
 requestShutdown = function()
   local ctx = getPlayerContext(); if not ctx then return end
   local p = players[ctx.unitName]
@@ -516,6 +558,9 @@ end
 -- Events & Timers
 ---------------------------
 onEvent = function(event)
+  -- Registered via world.addEventHandler(); asynchronous feed that can override player-driven menus when needed.
+  -- DCS events provide the authoritative truth for players entering/exiting phases.
+  -- We only process player-controlled units, ignoring AI to keep queues predictable.
   local id = event.id
   local initiator = event.initiator
   local place = event.place
@@ -523,6 +568,7 @@ onEvent = function(event)
   local pname = place and getAirbaseName(place) or "<nil>"
   logf("onEvent: id=%s initiator=%s place=%s", tostring(id), tostring(iname), tostring(pname))
   if id == world.event.S_EVENT_BIRTH then
+    -- Fired when a client spawns or slots into a unit (DCS engine).
     local unit = event.initiator
     if unit and unit.isExist and unit:isExist() and unit.getPlayerName and unit:getPlayerName() then
       local name = unit:getName()
@@ -542,6 +588,7 @@ onEvent = function(event)
       end
     end
   elseif id == world.event.S_EVENT_ENGINE_STARTUP then
+    -- Raised by DCS when the player's engines spool; we use it to mark engineStarted even if the player skipped the startup menu.
     local unit = event.initiator
     if unit and unit.isExist and unit:isExist() and unit.getPlayerName and unit:getPlayerName() then
       local name = unit:getName()
@@ -552,12 +599,14 @@ onEvent = function(event)
       end
     end
   elseif id == world.event.S_EVENT_RUNWAY_TAKEOFF then
+    -- Tower-specific takeoff trigger (DCS event) that allows the handoff menu to proceed without relying on timers alone.
     local unit = event.initiator
     if unit and unit.isExist and unit:isExist() and unit.getPlayerName and unit:getPlayerName() then
       local name = unit:getName()
       captureTelemetry(unit)
       local p = players[name]
       if p then
+        -- Once we see the official runway takeoff we can allow the pilot to request handoff.
         p.hasTakenOff = true
         logf("RUNWAY_TAKEOFF: player=%s marked as taken off", tostring(name))
       end
@@ -565,12 +614,14 @@ onEvent = function(event)
       logf("RUNWAY_TAKEOFF: %s from %s", tostring(name), tostring(placeName))
     end
   elseif id == world.event.S_EVENT_TAKEOFF then
+    -- Generic takeoff event (covers FARPs/carriers); supplements RUNWAY_TAKEOFF for telemetry but does not change state directly.
     local unit = event.initiator
     if unit and unit.isExist and unit:isExist() and unit.getPlayerName and unit:getPlayerName() then
       captureTelemetry(unit)
       logf("TAKEOFF: %s", tostring(unit:getName()))
     end
   elseif id == world.event.S_EVENT_LAND then
+    -- Landing event from the DCS engine; unlocks the ground phase and advances the landing queue.
     local unit = event.initiator
     if unit and unit.isExist and unit:isExist() and unit.getPlayerName and unit:getPlayerName() then
       local name = unit:getName()
@@ -582,6 +633,7 @@ onEvent = function(event)
         trigger.action.outTextForCoalition(p.coalitionID, "ATC Tower: Landing noted. Contact ground for taxi to parking.", 10, false)
         local q = landingQueues[p.airbaseName]
         if q then
+          -- Remove the landing aircraft and clear the next pilot in sequence, mirroring tower ops.
           for i, u in ipairs(q) do if u == name then table.remove(q, i) break end end
           if #q > 0 then
             local nextUnit = q[1]
@@ -598,7 +650,9 @@ onEvent = function(event)
   end
 end
 
+-- Scheduled via timer.scheduleFunction(); provides telemetry sampling and auto-transition guardrails when players skip menus.
 periodicApproachTick = function()
+  -- Background watchdog keeps telemetry fresh and nudges state transitions without user input.
   local ctx = getPlayerContext()
   if ctx then
     captureTelemetry(ctx.unit)
@@ -618,6 +672,8 @@ periodicApproachTick = function()
       if playerData.state == "take_off" and not playerData.hasTakenOff then
         local t = telemetry[unitName]
         if t and t.speed_mps then
+          -- DCS may miss runway events for FARPs or when lag spikes occur; speed heuristics
+          -- recover by inferring takeoff once the platform exceeds realistic rotation speed.
           local threshold = 90
           local okUnit, unitObj = pcall(Unit.getByName, unitName)
           if okUnit and unitObj and isHelicopter(unitObj) then
@@ -631,9 +687,11 @@ periodicApproachTick = function()
       end
     end
   end
+  -- Returning the next wake-up time keeps timer.scheduleFunction() looping.
   return timer.getTime() + 30
 end
 
+-- Timer watchdog that rebuilds menus if the mission resets them (e.g., due to scripting reloads or slot changes).
 retryAddMenus = function()
   -- Ensure BLUE/RED/NEUTRAL have menus
   local ids = getActiveCoalitionIDs()
@@ -643,6 +701,7 @@ retryAddMenus = function()
       ensureMenusForCoalition(coa)
     end
   end
+  -- Returning a timestamp keeps this scheduler alive in case scripts reload mid-mission.
   return timer.getTime() + 10
 end
 
@@ -658,5 +717,6 @@ for i = 1, #ids do
 end
 
 world.addEventHandler({ onEvent = onEvent })
+-- Timers are re-armed with a future timestamp to survive DCS's cooperative scheduler.
 timer.scheduleFunction(periodicApproachTick, {}, timer.getTime() + 30)
 timer.scheduleFunction(retryAddMenus,        {}, timer.getTime() + 5)
