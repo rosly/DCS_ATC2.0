@@ -17,8 +17,11 @@ end
 -- State & Structures
 ---------------------------
 -- Each player record now also tracks hasTakenOff (true when the player has left the runway).
+-- Primary per-unit state table used to drive the state machine for all radio calls.
+-- Possible states: not_started -> started -> on_taxi -> take_off -> airborne -> in_bound -> approach -> landed -> parked.
 local players          = {}   -- unitName -> { coalitionID, unitID, airbaseName, state, engineStarted, hasTakenOff }
 local unitCoalitions   = {}   -- unitName -> coalitionID
+-- Queues are maintained per airbase so that handoff/landing clearances happen in the order pilots request them.
 local takeoffQueues    = {}   -- airbaseName -> { unitName1, ... }
 local landingQueues    = {}   -- airbaseName -> { unitName1, ... }
 local menuPaths        = {}   -- coalitionID -> { root, ground, tower, approach, selectAB }
@@ -28,6 +31,8 @@ local telemetry        = {}   -- unitName -> { time=number, point=vec3, speed_mp
 -- Helicopter Support
 ---------------------------
 -- Determine if a unit is a helicopter based upon its description category.
+-- Some flows (e.g. takeoff speed checks) need to differentiate rotorcraft because runway
+-- events are unreliable for FARPs.  We inspect the DCS descriptor category rather than type strings.
 local function isHelicopter(unit)
   if not unit or not unit.getDesc then return false end
   local ok, desc = pcall(unit.getDesc, unit)
@@ -91,6 +96,8 @@ local function getAirbaseName(ab)
 end
 
 local function getPlayerContext()
+  -- The player context is pulled live from world.getPlayer() to avoid caching invalid objects
+  -- (DCS invalidates handles after death).  This function is called from menus and timers alike.
   local unit = world.getPlayer()
   if not unit or not unit.isExist or not unit:isExist() then return nil end
   local ctx = {
@@ -113,6 +120,8 @@ local function getPlayerContext()
 end
 
 -- Capture telemetry for range checks
+-- Telemetry snapshots are used for distance/speed checks between menu invocations and events.
+-- We do not rely solely on event flow because AI units and delayed events can desync the state machine.
 local function captureTelemetry(unit)
   if not unit or not unit.isExist or not unit:isExist() then return end
   local name = unit:getName()
@@ -177,6 +186,7 @@ ensureMenusForCoalition = function(coalitionID)
   menuPaths[coalitionID] = menuPaths[coalitionID] or {}
   local paths = menuPaths[coalitionID]
   if not paths.root then
+    -- Menus are created lazily the first time a coalition connects; missionCommands cannot be reused after removal.
     -- Root
     paths.root = missionCommands.addSubMenuForCoalition(coalitionID, "SpicyATC")
     -- Submenus
@@ -214,6 +224,7 @@ rebuildAirbaseList = function(coalitionID)
     missionCommands.removeItemForCoalition(coalitionID, paths.selectAB)
     paths.selectAB = nil
   end
+  -- The Select menu is rebuilt from scratch so we always reflect live ownership changes.
   paths.selectAB = missionCommands.addSubMenuForCoalition(coalitionID, "Select Home Airbase", paths.ground)
   -- Recommended (nearest owned)
   missionCommands.addCommandForCoalition(coalitionID, "Recommended (Nearest Owned)", paths.selectAB, function()
@@ -257,6 +268,8 @@ end
 
 -- Automatically assign the nearest owned airbase to the player if none is set.
 local function autoAssignHomeBase(ctx)
+  -- Menu flow assumes a home base exists.  When players spawn via slots or get slotted late,
+  -- no request has been made yet, so we opportunistically choose the closest owned airbase.
   if not ctx then return end
   local p = players[ctx.unitName]
   if p and not p.airbaseName then
@@ -289,6 +302,7 @@ requestStartup = function()
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Not in correct state for startup.", 10, false)
     return
   end
+  -- Startup clearance is the entry point into the takeoff flow; once granted we expect taxi next.
   p.state = "started"
   local group = ctx.group
   local numUnits = group and group.getUnits and #group:getUnits() or 1
@@ -332,6 +346,7 @@ requestTaxi = function()
   captureTelemetry(ctx.unit)
   local t = telemetry[ctx.unitName]
   if t then
+    -- Stash the point to guard against players requesting takeoff without actually taxiing.
     p.taxiStartPoint = t.point
     logf("requestTaxi: stored taxiStartPoint for %s at (x=%.1f,z=%.1f)", ctx.unitName, t.point.x or 0, t.point.z or 0)
   end
@@ -355,6 +370,7 @@ requestTakeoff = function()
   if p.taxiStartPoint and tCurr and tCurr.point then
     local distMoved = planarDistanceMeters(p.taxiStartPoint, tCurr.point)
     if distMoved < 50 then
+      -- Prevents players from skipping the taxi phase by requesting takeoff while stationary at parking.
       trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Taxi to the runway before requesting takeoff.", 10, false)
       return
     end
@@ -366,6 +382,7 @@ requestTakeoff = function()
   local abName = p.airbaseName
   takeoffQueues[abName] = takeoffQueues[abName] or {}
   local q = takeoffQueues[abName]
+  -- Queue position determines clearance order; we keep players informed of their spot.
   table.insert(q, ctx.unitName)
   local pos = #q
   logf("requestTakeoff: unit=%s queuedPos=%d at=%s", tostring(ctx.unitName), pos, tostring(abName))
@@ -411,6 +428,7 @@ setAirborne = function(unitName)
   trigger.action.outTextForCoalition(p.coalitionID, "ATC Tower: Handoff acknowledged. Contact Slasher to check in.", 10, false)
   local q = takeoffQueues[abName]
   if q then
+    -- Remove the aircraft from the queue and immediately advance the next client.
     for i, u in ipairs(q) do if u == unitName then table.remove(q, i) break end end
     if #q > 0 then
       local nextUnit = q[1]
@@ -439,9 +457,11 @@ requestInbound = function()
     end
   end
   if p.state ~= "airborne" or not ctx.unit:inAir() then
+    -- Some modules can sit on the runway but still appear "airborne" in state; the inAir() check guards that edge case.
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Not airborne or incorrect state.", 10, false)
     return
   end
+  -- Transition back into tower control: record the intent and enqueue for landing sequencing.
   p.state = "in_bound"
   landingQueues[p.airbaseName] = landingQueues[p.airbaseName] or {}
   table.insert(landingQueues[p.airbaseName], ctx.unitName)
@@ -460,9 +480,11 @@ requestApproach = function()
   local ab = Airbase.getByName(p.airbaseName)
   local d  = planarDistanceMeters(pointOf(ctx.unit), pointOf(ab))
   if d > 10 * 1852 then
+    -- 10 NM gate mirrors typical pattern entry ranges; outside this we keep the pilot in the inbound phase.
     trigger.action.outTextForCoalition(ctx.coalitionID, "ATC: Too far for approach (current " .. string.format("%.1f", metersToNM(d)) .. " NM).", 10, false)
     return
   end
+  -- Approach is a holding state until tower gives final clearance via requestLanding().
   p.state = "approach"
   logf("requestApproach: unit=%s -> approach (%s)", tostring(ctx.unitName), tostring(p.airbaseName))
   trigger.action.outTextForCoalition(ctx.coalitionID, "ATC Slasher: Approach cleared. Contact tower for landing clearance.", 10, false)
@@ -477,6 +499,7 @@ requestLanding = function()
   end
   local q = landingQueues[p.airbaseName] or {}
   local pos = 0
+  -- Landing queues are seeded during requestInbound; here we simply report the pilot's slot.
   for i, u in ipairs(q) do if u == ctx.unitName then pos = i break end end
   logf("requestLanding: unit=%s queuePos=%d dest=%s", tostring(ctx.unitName), pos, tostring(p.airbaseName))
   if pos == 1 then
@@ -516,6 +539,8 @@ end
 -- Events & Timers
 ---------------------------
 onEvent = function(event)
+  -- DCS events provide the authoritative truth for players entering/exiting phases.
+  -- We only process player-controlled units, ignoring AI to keep queues predictable.
   local id = event.id
   local initiator = event.initiator
   local place = event.place
@@ -558,6 +583,7 @@ onEvent = function(event)
       captureTelemetry(unit)
       local p = players[name]
       if p then
+        -- Once we see the official runway takeoff we can allow the pilot to request handoff.
         p.hasTakenOff = true
         logf("RUNWAY_TAKEOFF: player=%s marked as taken off", tostring(name))
       end
@@ -582,6 +608,7 @@ onEvent = function(event)
         trigger.action.outTextForCoalition(p.coalitionID, "ATC Tower: Landing noted. Contact ground for taxi to parking.", 10, false)
         local q = landingQueues[p.airbaseName]
         if q then
+          -- Remove the landing aircraft and clear the next pilot in sequence, mirroring tower ops.
           for i, u in ipairs(q) do if u == name then table.remove(q, i) break end end
           if #q > 0 then
             local nextUnit = q[1]
@@ -599,6 +626,7 @@ onEvent = function(event)
 end
 
 periodicApproachTick = function()
+  -- Background watchdog keeps telemetry fresh and nudges state transitions without user input.
   local ctx = getPlayerContext()
   if ctx then
     captureTelemetry(ctx.unit)
@@ -618,6 +646,8 @@ periodicApproachTick = function()
       if playerData.state == "take_off" and not playerData.hasTakenOff then
         local t = telemetry[unitName]
         if t and t.speed_mps then
+          -- DCS may miss runway events for FARPs or when lag spikes occur; speed heuristics
+          -- recover by inferring takeoff once the platform exceeds realistic rotation speed.
           local threshold = 90
           local okUnit, unitObj = pcall(Unit.getByName, unitName)
           if okUnit and unitObj and isHelicopter(unitObj) then
@@ -631,6 +661,7 @@ periodicApproachTick = function()
       end
     end
   end
+  -- Returning the next wake-up time keeps timer.scheduleFunction() looping.
   return timer.getTime() + 30
 end
 
@@ -643,6 +674,7 @@ retryAddMenus = function()
       ensureMenusForCoalition(coa)
     end
   end
+  -- Returning a timestamp keeps this scheduler alive in case scripts reload mid-mission.
   return timer.getTime() + 10
 end
 
@@ -658,5 +690,6 @@ for i = 1, #ids do
 end
 
 world.addEventHandler({ onEvent = onEvent })
+-- Timers are re-armed with a future timestamp to survive DCS's cooperative scheduler.
 timer.scheduleFunction(periodicApproachTick, {}, timer.getTime() + 30)
 timer.scheduleFunction(retryAddMenus,        {}, timer.getTime() + 5)
