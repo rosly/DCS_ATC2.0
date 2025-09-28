@@ -27,6 +27,32 @@ Built by Spicy @spicy2160 (discord)
 
 - Automatic landing and "inbound detection".
 
+## Architecture overview
+
+- **Centralized player lifecycle** – every pilot is tracked through an explicit state machine (`not_started → … → parked`). Menu handlers, DCS engine events, and watchdog timers coordinate to keep pilots in sequence and reject out-of-order requests.
+- **Coalition-aware radio menus** – F10 menus are created lazily for each coalition and rebuilt automatically if DCS clears them. Ground, Tower, and Slasher (approach) submenus expose the scripted flow without affecting the stock ATC.
+- **Automatic home-base context** – spawn events and menu handlers call the nearest-owned airbase heuristic so a player always has a valid destination even if they never touch the “Select Home Airbase” list.
+- **Queue-driven clearances** – per-airbase tables keep takeoff and landing requests in order. Only the front-of-line pilot receives clearance, mirroring real-world tower control.
+- **Telemetry safeguards** – periodic sampling records position and speed so the script can prove that taxi actually happened, infer FARPs/carrier departures when `RUNWAY_TAKEOFF` is missing, and auto-advance inbound aircraft that forget to hit the menus.
+- **Event reconciliation** – authoritative DCS events (`BIRTH`, `ENGINE_STARTUP`, `RUNWAY_TAKEOFF`, `LAND`) override menu assumptions to keep the lifecycle honest if a player skips steps or if lag delays callbacks.
+- **Resilient watchdogs** – timers rebuild menus after scripting resets, refresh telemetry, and auto-transition aircraft into approach so long missions stay synchronized.
+- **Mission-agnostic integration** – initialization seeds all coalition menus and registers the global event handler, so mission authors only need a single “Do Script” trigger.
+
+## Reading path for developers
+
+1. **State & data tables** – skim the top of `SpicyATC.lua` to understand the player record, queue structures, and telemetry store that drive every menu callback.
+2. **Menu construction** – review `ensureMenusForCoalition` and `rebuildAirbaseList` to see how the F10 tree is built and refreshed.
+3. **Player flow handlers** – follow the ground-to-air-to-ground sequence (`requestStartup` through `requestShutdown`) to understand the nominal progression and queue bookkeeping.
+4. **Event handler** – study `onEvent` to learn how DCS engine signals reconcile the script with simulator truth and recover from skipped menus.
+5. **Watchdogs/timers** – finish with `periodicApproachTick` and `retryAddMenus`, which keep telemetry fresh and menus present during long missions.
+
+## Operational flow at a glance
+
+- **Startup & taxi** – ground handlers require the previous state, automatically assign a home base, and capture taxi telemetry before tower calls are honored.
+- **Departure sequence** – tower adds the pilot to the takeoff queue, and only `RUNWAY_TAKEOFF` (or speed heuristics) unlocks the handoff to Slasher.
+- **Recovery pipeline** – Slasher manages inbound and approach gating, while tower landing calls consult the queue until `S_EVENT_LAND` promotes the next pilot.
+- **Post-landing wrap-up** – ground commands transition crews through parking and shutdown for immersion even though DCS lacks parking occupancy events.
+
 ## Installation
 
 1. Download the latest release .zip file from the releases page.
